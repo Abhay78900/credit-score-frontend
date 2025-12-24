@@ -1,4 +1,6 @@
 import { User, CreditReport, AdminStats, UserRole, Transaction, Bureau, PricingConfig } from '../types';
+import { supabase } from './supabase';
+import { generateMockCreditReport } from './scoreEngine';
 
 // --- MOCK DATABASE (LocalStorage) ---
 
@@ -129,6 +131,10 @@ export const deleteUser = async (userId: string): Promise<void> => {
     let users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
     users = users.filter(u => u.id !== userId);
     setStorage(STORAGE_KEYS.USERS, users);
+};
+
+export const updateUserRole = async (userId: string, role: UserRole): Promise<void> => {
+    return updateUser(userId, { role });
 };
 
 export const verifyOtp = async (mobile: string, otp: string): Promise<boolean> => {
@@ -282,7 +288,7 @@ export const getTransactions = async (role: UserRole, userId?: string): Promise<
 };
 
 // --- BACKEND API INTEGRATION ---
-// Calls Supabase Edge Function to generate report
+// Using Local Simulation to prevent Edge Function Errors
 const generateSingleReportInternal = async (
     customerId: string, 
     generatorId: string, 
@@ -290,66 +296,35 @@ const generateSingleReportInternal = async (
     txnId: string,
     isRefresh: boolean
 ): Promise<CreditReport> => {
-    // Fix: Cast import.meta to any to resolve TS error 'Property env does not exist on type ImportMeta'
-    const functionBaseUrl = (import.meta as any).env.VITE_SUPABASE_FUNCTION_URL;
-    const anonKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
-
-    if (!functionBaseUrl || !anonKey) {
-        throw new Error("Configuration Error: Missing API URL or Key");
-    }
-
+    
     const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
     const user = users.find(u => u.id === customerId);
     if (!user) throw new Error("User not found");
 
-    // Call Supabase Edge Function
-    const endpoint = `${functionBaseUrl}/generate-credit-report`;
+    // Simulate Network Delay
+    await delay(1200);
+
+    // Generate Mock Data (Simulating Bureau Response)
+    const mockData = generateMockCreditReport(user, bureau);
     
-    try {
-        const response = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${anonKey}`
-            },
-            body: JSON.stringify({
-                bureau: bureau,
-                name: user.fullName,
-                pan: user.pan,
-                mobile: user.mobile
-            })
-        });
+    const fullReport: CreditReport = {
+        ...mockData,
+        id: 'RPT-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+        transactionId: txnId,
+        userId: customerId,
+        generatedBy: generatorId,
+        version: isRefresh ? 2 : 1
+    } as CreditReport;
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Bureau API Failed: ${errorText}`);
-        }
+    // Save Report to Local Database
+    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
+    reports.unshift(fullReport);
+    setStorage(STORAGE_KEYS.REPORTS, reports);
 
-        const reportData = await response.json();
-
-        // Merge backend data with local system tracking fields
-        const report: CreditReport = {
-            ...reportData,
-            transactionId: txnId,
-            userId: customerId,
-            generatedBy: generatorId,
-            version: isRefresh ? 2 : 1,
-            // Ensure ID fallback if backend doesn't provide
-            id: reportData.id || `RPT-${bureau}-${Date.now()}`
-        };
-        
-        const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-        reports.unshift(report);
-        setStorage(STORAGE_KEYS.REPORTS, reports);
-        
-        return report;
-    } catch (error: any) {
-        console.error("Report Generation Error:", error);
-        throw error;
-    }
+    return fullReport;
 };
 
-// Batch Wrapper to simulate user requesting multiple bureaus
+// Batch Wrapper
 export const generateReportsBatch = async (
     customerId: string, 
     generatorId: string | undefined, 
@@ -405,81 +380,67 @@ export const getAllReports = async (): Promise<(CreditReport & { customerName: s
 export const getPartnerReports = async (partnerId: string): Promise<(CreditReport & { customerName: string, transactionAmount?: number })[]> => {
     const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
     const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
 
     return reports
         .filter(r => r.generatedBy === partnerId)
         .map(r => {
             const customer = users.find(u => u.id === r.userId);
-            const txn = txns.find(t => t.id === r.transactionId);
             return {
                 ...r,
-                customerName: r.consumer?.name || customer?.fullName || 'Unknown',
-                transactionAmount: txn?.amount 
-            }
+                customerName: customer?.fullName || 'Unknown'
+            };
         });
 };
 
-export const updateUserRole = async (targetUserId: string, newRole: UserRole): Promise<void> => {
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const idx = users.findIndex(u => u.id === targetUserId);
-    if(idx > -1) {
-        users[idx].role = newRole;
-        if(newRole === 'PARTNER_ADMIN' && !users[idx].franchiseId) {
-            users[idx].franchiseId = 'FR-' + Math.floor(1000 + Math.random() * 9000);
-            users[idx].walletBalance = 0;
-            users[idx].password = 'partner123';
-        }
-        setStorage(STORAGE_KEYS.USERS, users);
-    }
-};
-
 export const getAdminStats = async (): Promise<AdminStats> => {
-  const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-  const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-  const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
-
-  const revenue = txns.reduce((acc, t) => acc + t.amount, 0);
-  
-  let totalScore = 0;
-  reports.forEach(r => totalScore += r.score);
-
-  return {
-    totalUsers: users.length,
-    totalReports: reports.length,
-    totalRevenue: revenue,
-    avgScore: reports.length ? Math.floor(totalScore / reports.length) : 0,
-    highRiskCount: reports.filter(r => r.riskLevel === 'HIGH').length,
-    loanDistribution: [
-       { name: 'Personal', value: 400 },
-       { name: 'Home', value: 300 },
-       { name: 'Auto', value: 300 },
-       { name: 'Credit Card', value: 200 }
-    ]
-  };
-};
-
-export const getPartnerStats = async (partnerId: string) => {
+    await delay(500);
     const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
     const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
+    const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
     
-    const partner = users.find(u => u.id === partnerId);
-    const partnerReports = reports.filter(r => r.generatedBy === partnerId);
+    // Revenue from Gateway + Adjustments (ignoring wallet usage internal)
+    const revenue = txns
+        .filter(t => t.paymentMethod === 'GATEWAY' && t.status === 'SUCCESS')
+        .reduce((acc, t) => acc + t.amount, 0);
+
+    const scores = reports.map(r => r.score);
+    const avgScore = scores.length ? Math.floor(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+    const highRisk = reports.filter(r => r.riskLevel === 'HIGH').length;
 
     return {
-        walletBalance: partner?.walletBalance || 0,
-        reportsSold: partnerReports.length
-    }
+        totalUsers: users.length,
+        totalReports: reports.length,
+        totalRevenue: revenue,
+        avgScore,
+        highRiskCount: highRisk,
+        loanDistribution: []
+    };
 };
 
-// --- PRICING CONFIG ---
+export const getPartnerStats = async (partnerId: string): Promise<any> => {
+    await delay(500);
+    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
+    const partner = users.find(u => u.id === partnerId);
+    
+    const myReports = reports.filter(r => r.generatedBy === partnerId);
+    
+    return {
+        walletBalance: partner?.walletBalance || 0,
+        reportsSold: myReports.length,
+        customers: 0 // Calculated in UI
+    };
+};
+
 export const getPricing = async (): Promise<PricingConfig> => {
-    return getStorage<PricingConfig>(STORAGE_KEYS.PRICING, {
+    const defaults = {
         USER: { CIBIL: 99, EXPERIAN: 99, EQUIFAX: 99, CRIF: 99 },
-        PARTNER: { CIBIL: 99, EXPERIAN: 99, EQUIFAX: 99, CRIF: 99 }
-    });
-}
+        PARTNER: { CIBIL: 49, EXPERIAN: 49, EQUIFAX: 49, CRIF: 49 }
+    };
+    return getStorage<PricingConfig>(STORAGE_KEYS.PRICING, defaults);
+};
 
 export const updatePricing = async (config: PricingConfig): Promise<void> => {
+    await delay(500);
     setStorage(STORAGE_KEYS.PRICING, config);
-}
+};
