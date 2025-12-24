@@ -1,5 +1,4 @@
 import { User, CreditReport, AdminStats, UserRole, Transaction, Bureau, PricingConfig } from '../types';
-import { generateSingleBureauReport } from './scoreEngine';
 
 // --- MOCK DATABASE (LocalStorage) ---
 
@@ -282,8 +281,8 @@ export const getTransactions = async (role: UserRole, userId?: string): Promise<
     return txns;
 };
 
-// --- SINGLE BACKEND ENDPOINT SIMULATION ---
-// Generates a Single Report for a Specific Bureau
+// --- BACKEND API INTEGRATION ---
+// Calls Supabase Edge Function to generate report
 const generateSingleReportInternal = async (
     customerId: string, 
     generatorId: string, 
@@ -291,24 +290,63 @@ const generateSingleReportInternal = async (
     txnId: string,
     isRefresh: boolean
 ): Promise<CreditReport> => {
-    await delay(1000); // Simulate API call latency
+    // Fix: Cast import.meta to any to resolve TS error 'Property env does not exist on type ImportMeta'
+    const functionBaseUrl = (import.meta as any).env.VITE_SUPABASE_FUNCTION_URL;
+    const anonKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
+
+    if (!functionBaseUrl || !anonKey) {
+        throw new Error("Configuration Error: Missing API URL or Key");
+    }
+
     const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
     const user = users.find(u => u.id === customerId);
     if (!user) throw new Error("User not found");
 
-    const report = generateSingleBureauReport(
-        user, 
-        generatorId, 
-        bureau, 
-        txnId, 
-        isRefresh ? 2 : 1
-    );
+    // Call Supabase Edge Function
+    const endpoint = `${functionBaseUrl}/generate-credit-report`;
     
-    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-    reports.unshift(report);
-    setStorage(STORAGE_KEYS.REPORTS, reports);
-    
-    return report;
+    try {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${anonKey}`
+            },
+            body: JSON.stringify({
+                bureau: bureau,
+                name: user.fullName,
+                pan: user.pan,
+                mobile: user.mobile
+            })
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Bureau API Failed: ${errorText}`);
+        }
+
+        const reportData = await response.json();
+
+        // Merge backend data with local system tracking fields
+        const report: CreditReport = {
+            ...reportData,
+            transactionId: txnId,
+            userId: customerId,
+            generatedBy: generatorId,
+            version: isRefresh ? 2 : 1,
+            // Ensure ID fallback if backend doesn't provide
+            id: reportData.id || `RPT-${bureau}-${Date.now()}`
+        };
+        
+        const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
+        reports.unshift(report);
+        setStorage(STORAGE_KEYS.REPORTS, reports);
+        
+        return report;
+    } catch (error: any) {
+        console.error("Report Generation Error:", error);
+        throw error;
+    }
 };
 
 // Batch Wrapper to simulate user requesting multiple bureaus
@@ -321,21 +359,24 @@ export const generateReportsBatch = async (
 ): Promise<CreditReport[]> => {
     const results: CreditReport[] = [];
     for (const bureau of bureaus) {
-        const report = await generateSingleReportInternal(
-            customerId, 
-            generatorId || customerId, 
-            bureau, 
-            transactionId, 
-            paymentType === 'REFRESH'
-        );
-        results.push(report);
+        try {
+            const report = await generateSingleReportInternal(
+                customerId, 
+                generatorId || customerId, 
+                bureau, 
+                transactionId, 
+                paymentType === 'REFRESH'
+            );
+            results.push(report);
+        } catch (e) {
+            console.error(`Failed to generate ${bureau} report:`, e);
+        }
     }
     return results;
 };
 
 export const getUserLatestReports = async (userId: string): Promise<CreditReport[]> => {
   const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-  // Return all reports for the user, logic in UI can group them
   return reports.filter(r => r.userId === userId);
 };
 
@@ -350,7 +391,6 @@ export const getAllReports = async (): Promise<(CreditReport & { customerName: s
     return reports.map(r => {
         const customer = users.find(u => u.id === r.userId);
         const generator = users.find(u => u.id === r.generatedBy);
-        // Fallback for customerName if consumer.name is missing (should not happen in new reports)
         const name = r.consumer?.name || customer?.fullName || 'Unknown';
         
         return {
@@ -371,12 +411,11 @@ export const getPartnerReports = async (partnerId: string): Promise<(CreditRepor
         .filter(r => r.generatedBy === partnerId)
         .map(r => {
             const customer = users.find(u => u.id === r.userId);
-            // Approximate txn mapping
             const txn = txns.find(t => t.id === r.transactionId);
             return {
                 ...r,
                 customerName: r.consumer?.name || customer?.fullName || 'Unknown',
-                transactionAmount: txn?.amount // This is total transaction amount, strictly not per report cost, but okay for mock
+                transactionAmount: txn?.amount 
             }
         });
 };
