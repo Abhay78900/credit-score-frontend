@@ -2,7 +2,7 @@ import { User, CreditReport, AdminStats, UserRole, Transaction, Bureau, PricingC
 import { supabase } from './supabase';
 import { generateMockCreditReport } from './scoreEngine';
 
-// --- MOCK DATABASE (LocalStorage) ---
+// --- CONSTANTS ---
 
 const STORAGE_KEYS = {
   USERS: 'credi_users',
@@ -12,20 +12,93 @@ const STORAGE_KEYS = {
   PRICING: 'credi_pricing'
 };
 
-const getStorage = <T>(key: string, defaultVal: T): T => {
-  const data = localStorage.getItem(key);
-  return data ? JSON.parse(data) : defaultVal;
+const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// --- HYBRID DATA LAYER (Supabase + LocalStorage Fallback) ---
+
+// Helper to check if we can talk to Supabase Tables
+let isSupabaseConnected = true; // Optimistic default
+
+const safeDbSelect = async <T>(table: string, queryBuilder: any, localKey: string): Promise<T[]> => {
+    // Try Supabase first
+    if (isSupabaseConnected) {
+        try {
+            const { data, error } = await queryBuilder;
+            if (!error && data) return data as T[];
+            // If error is "relation does not exist" (404 for table), switch to local
+            if (error?.code === '42P01' || error?.message?.includes('does not exist')) {
+                console.warn(`Supabase table '${table}' missing. Falling back to LocalStorage.`);
+                isSupabaseConnected = false;
+            }
+        } catch (e) {
+            console.warn(`Supabase connection failed for '${table}'. Falling back.`);
+            isSupabaseConnected = false;
+        }
+    }
+    // Fallback
+    const local = localStorage.getItem(localKey);
+    return local ? JSON.parse(local) : [];
 };
 
-const setStorage = (key: string, data: any) => {
-  localStorage.setItem(key, JSON.stringify(data));
+const safeDbInsert = async (table: string, data: any, localKey: string) => {
+    // Try Supabase
+    if (isSupabaseConnected) {
+        try {
+            // Strip any fields that might not exist in a simple schema if needed, 
+            // but for now we send the full object.
+            const { error } = await supabase.from(table).insert(data);
+            if (error) {
+                if (error.code === '42P01') isSupabaseConnected = false;
+                else console.error(`Supabase Insert Error [${table}]:`, error.message);
+            }
+        } catch (e) {
+             console.warn(`Supabase insert failed. Falling back.`);
+        }
+    }
+    // Always write to LocalStorage to ensure sync/offline capability
+    const current = JSON.parse(localStorage.getItem(localKey) || '[]');
+    // Avoid duplicates if ID exists
+    const existingIdx = current.findIndex((i: any) => i.id === data.id);
+    if (existingIdx >= 0) current[existingIdx] = data;
+    else current.push(data);
+    
+    localStorage.setItem(localKey, JSON.stringify(current));
 };
 
-// Seed Master Admin if not exists
-const seedData = () => {
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+const safeDbUpdate = async (table: string, id: string, updates: any, localKey: string) => {
+    if (isSupabaseConnected) {
+        try {
+            await supabase.from(table).update(updates).eq('id', id);
+        } catch (e) { console.warn("Supabase update failed"); }
+    }
+    // Local
+    const current = JSON.parse(localStorage.getItem(localKey) || '[]');
+    const idx = current.findIndex((i: any) => i.id === id);
+    if (idx !== -1) {
+        current[idx] = { ...current[idx], ...updates };
+        localStorage.setItem(localKey, JSON.stringify(current));
+    }
+};
+
+const safeDbDelete = async (table: string, id: string, localKey: string) => {
+     if (isSupabaseConnected) {
+        try {
+            await supabase.from(table).delete().eq('id', id);
+        } catch (e) { console.warn("Supabase delete failed"); }
+    }
+    // Local
+    let current = JSON.parse(localStorage.getItem(localKey) || '[]');
+    current = current.filter((i: any) => i.id !== id);
+    localStorage.setItem(localKey, JSON.stringify(current));
+}
+
+
+// --- SEEDING ---
+const seedData = async () => {
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+    
     if (!users.find(u => u.role === 'MASTER_ADMIN')) {
-        users.push({
+        const admin: User = {
             id: 'admin-001',
             fullName: 'Master Admin',
             email: 'admin@credicheck.com',
@@ -41,36 +114,34 @@ const seedData = () => {
             idNumber: 'ADMIN0000X',
             occupation: 'Admin',
             income: 'N/A'
-        });
-        setStorage(STORAGE_KEYS.USERS, users);
+        };
+        await safeDbInsert('users', admin, STORAGE_KEYS.USERS);
     }
-    // Seed Default Pricing
+
     if (!localStorage.getItem(STORAGE_KEYS.PRICING)) {
-        setStorage(STORAGE_KEYS.PRICING, {
+        localStorage.setItem(STORAGE_KEYS.PRICING, JSON.stringify({
             USER: { CIBIL: 99, EXPERIAN: 99, EQUIFAX: 99, CRIF: 99 },
             PARTNER: { CIBIL: 49, EXPERIAN: 49, EQUIFAX: 49, CRIF: 49 }
-        });
+        }));
     }
 };
 seedData();
 
-// --- API SERVICES ---
 
-const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+// --- API SERVICES ---
 
 // Auth & User
 export const registerUser = async (userData: any): Promise<User> => {
   await delay(800);
-  const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+  const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
   
   // Check duplicates
   const existing = users.find(u => u.mobile === userData.mobile || u.pan === userData.pan);
   if (existing) {
       if(userData.role === 'PARTNER_ADMIN' || !existing.role) throw new Error("User already exists");
-      return existing; // Return existing for normal flow
+      return existing; 
   }
 
-  // Normalize Address to Array
   let addressArr: string[] = [];
   if (Array.isArray(userData.address)) {
       addressArr = userData.address;
@@ -94,8 +165,7 @@ export const registerUser = async (userData: any): Promise<User> => {
     income: userData.income || '5-10 Lakhs'
   };
   
-  users.push(newUser);
-  setStorage(STORAGE_KEYS.USERS, users);
+  await safeDbInsert('users', newUser, STORAGE_KEYS.USERS);
   
   if(!userData.role || userData.role === 'USER') {
       localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(newUser));
@@ -113,24 +183,16 @@ export const createPartner = async (partnerData: any): Promise<User> => {
 };
 
 export const updateUser = async (userId: string, updates: Partial<User>): Promise<void> => {
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx !== -1) {
-        users[idx] = { ...users[idx], ...updates };
-        setStorage(STORAGE_KEYS.USERS, users);
-        
-        // Update session if self
-        const currentUser = getCurrentUser();
-        if(currentUser?.id === userId) {
-            localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(users[idx]));
-        }
+    await safeDbUpdate('users', userId, updates, STORAGE_KEYS.USERS);
+    // Session update
+    const currentUser = getCurrentUser();
+    if(currentUser?.id === userId) {
+        localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify({ ...currentUser, ...updates }));
     }
 };
 
 export const deleteUser = async (userId: string): Promise<void> => {
-    let users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    users = users.filter(u => u.id !== userId);
-    setStorage(STORAGE_KEYS.USERS, users);
+    await safeDbDelete('users', userId, STORAGE_KEYS.USERS);
 };
 
 export const updateUserRole = async (userId: string, role: UserRole): Promise<void> => {
@@ -144,7 +206,9 @@ export const verifyOtp = async (mobile: string, otp: string): Promise<boolean> =
 
 export const unifiedLogin = async (identifier: string, passOrOtp: string): Promise<User | null> => {
     await delay(800);
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+    // Fetch latest users
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+    
     const user = users.find(u => u.email === identifier || u.mobile === identifier);
     
     if (!user) return null;
@@ -181,15 +245,15 @@ export const getCurrentUser = (): User | null => {
 // Wallet & Payments
 export const loadWalletFunds = async (userId: string, amount: number): Promise<boolean> => {
     await delay(1000);
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const idx = users.findIndex(u => u.id === userId);
-    if(idx > -1) {
-        users[idx].walletBalance = (users[idx].walletBalance || 0) + amount;
-        setStorage(STORAGE_KEYS.USERS, users);
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+    const user = users.find(u => u.id === userId);
+    
+    if(user) {
+        const newBalance = (user.walletBalance || 0) + amount;
+        await safeDbUpdate('users', userId, { walletBalance: newBalance }, STORAGE_KEYS.USERS);
         
         // Log Transaction
-        const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
-        txns.unshift({
+        const txn: Transaction = {
             id: 'TXN-W-' + Date.now(),
             userId,
             amount,
@@ -199,12 +263,12 @@ export const loadWalletFunds = async (userId: string, amount: number): Promise<b
             paymentMethod: 'GATEWAY',
             type: 'WALLET_TOPUP',
             description: 'Wallet Recharge via Gateway'
-        });
-        setStorage(STORAGE_KEYS.TXNS, txns);
+        };
+        await safeDbInsert('transactions', txn, STORAGE_KEYS.TXNS);
         
         const current = getCurrentUser();
         if(current?.id === userId) {
-            localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(users[idx]));
+            localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify({ ...current, walletBalance: newBalance }));
         }
         return true;
     }
@@ -212,18 +276,16 @@ export const loadWalletFunds = async (userId: string, amount: number): Promise<b
 };
 
 export const adjustPartnerWallet = async (partnerId: string, amount: number, type: 'CREDIT' | 'DEBIT', description: string): Promise<void> => {
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const idx = users.findIndex(u => u.id === partnerId);
-    if (idx === -1) throw new Error("Partner not found");
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+    const user = users.find(u => u.id === partnerId);
+    if (!user) throw new Error("Partner not found");
 
-    const currentBal = users[idx].walletBalance || 0;
+    const currentBal = user.walletBalance || 0;
     const newBal = type === 'CREDIT' ? currentBal + amount : currentBal - amount;
     
-    users[idx].walletBalance = newBal;
-    setStorage(STORAGE_KEYS.USERS, users);
+    await safeDbUpdate('users', partnerId, { walletBalance: newBal }, STORAGE_KEYS.USERS);
 
-    const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
-    txns.unshift({
+    const txn: Transaction = {
         id: 'TXN-ADJ-' + Date.now(),
         userId: partnerId,
         amount,
@@ -233,8 +295,8 @@ export const adjustPartnerWallet = async (partnerId: string, amount: number, typ
         paymentMethod: 'ADMIN_ADJUSTMENT',
         type: 'ADMIN_ADJUSTMENT',
         description: `${type}: ${description}`
-    });
-    setStorage(STORAGE_KEYS.TXNS, txns);
+    };
+    await safeDbInsert('transactions', txn, STORAGE_KEYS.TXNS);
 };
 
 export const processPayment = async (
@@ -247,25 +309,25 @@ export const processPayment = async (
   await delay(1500);
   
   if (method === 'WALLET') {
-      const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-      const userIdx = users.findIndex(u => u.id === userId);
-      if(userIdx > -1) {
-          if ((users[userIdx].walletBalance || 0) < totalAmount) {
+      const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+      const user = users.find(u => u.id === userId);
+      
+      if(user) {
+          if ((user.walletBalance || 0) < totalAmount) {
               return null; // Insufficient funds
           }
-          users[userIdx].walletBalance = (users[userIdx].walletBalance || 0) - totalAmount;
-          setStorage(STORAGE_KEYS.USERS, users);
+          const newBal = (user.walletBalance || 0) - totalAmount;
+          await safeDbUpdate('users', userId, { walletBalance: newBal }, STORAGE_KEYS.USERS);
           
           const current = getCurrentUser();
           if(current?.id === userId) {
-             localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(users[userIdx]));
+             localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify({ ...current, walletBalance: newBal }));
           }
       }
   }
 
   const txnId = 'TXN-' + Date.now();
-  const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
-  txns.unshift({
+  const txn: Transaction = {
       id: txnId,
       userId,
       amount: totalAmount,
@@ -274,21 +336,21 @@ export const processPayment = async (
       status: 'SUCCESS',
       paymentMethod: method,
       type
-  });
-  setStorage(STORAGE_KEYS.TXNS, txns);
+  };
+  await safeDbInsert('transactions', txn, STORAGE_KEYS.TXNS);
   return txnId;
 };
 
 export const getTransactions = async (role: UserRole, userId?: string): Promise<Transaction[]> => {
-    const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
+    const txns = await safeDbSelect<Transaction>('transactions', supabase.from('transactions').select('*'), STORAGE_KEYS.TXNS);
     if (userId) {
         return txns.filter(t => t.userId === userId);
     }
     return txns;
 };
 
-// --- BACKEND API INTEGRATION ---
-// Using Local Simulation to prevent Edge Function Errors
+// --- CORE REPORT GENERATION ENGINE ---
+// CRITICAL FIX: Running this Client-Side (or via DB) instead of calling a missing Edge Function
 const generateSingleReportInternal = async (
     customerId: string, 
     generatorId: string, 
@@ -297,14 +359,14 @@ const generateSingleReportInternal = async (
     isRefresh: boolean
 ): Promise<CreditReport> => {
     
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
     const user = users.find(u => u.id === customerId);
     if (!user) throw new Error("User not found");
 
     // Simulate Network Delay
     await delay(1200);
 
-    // Generate Mock Data (Simulating Bureau Response)
+    // Generate Data using the Local Engine
     const mockData = generateMockCreditReport(user, bureau);
     
     const fullReport: CreditReport = {
@@ -316,10 +378,8 @@ const generateSingleReportInternal = async (
         version: isRefresh ? 2 : 1
     } as CreditReport;
 
-    // Save Report to Local Database
-    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-    reports.unshift(fullReport);
-    setStorage(STORAGE_KEYS.REPORTS, reports);
+    // Persist to Database (Supabase + Local)
+    await safeDbInsert('reports', fullReport, STORAGE_KEYS.REPORTS);
 
     return fullReport;
 };
@@ -351,17 +411,17 @@ export const generateReportsBatch = async (
 };
 
 export const getUserLatestReports = async (userId: string): Promise<CreditReport[]> => {
-  const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
+  const reports = await safeDbSelect<CreditReport>('reports', supabase.from('reports').select('*'), STORAGE_KEYS.REPORTS);
   return reports.filter(r => r.userId === userId);
 };
 
 export const getAllUsers = async (): Promise<User[]> => {
-  return getStorage<User[]>(STORAGE_KEYS.USERS, []);
+  return safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
 };
 
 export const getAllReports = async (): Promise<(CreditReport & { customerName: string, generatorName: string, partnerFranchiseId?: string })[]> => {
-    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+    const reports = await safeDbSelect<CreditReport>('reports', supabase.from('reports').select('*'), STORAGE_KEYS.REPORTS);
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
     
     return reports.map(r => {
         const customer = users.find(u => u.id === r.userId);
@@ -378,8 +438,8 @@ export const getAllReports = async (): Promise<(CreditReport & { customerName: s
 };
 
 export const getPartnerReports = async (partnerId: string): Promise<(CreditReport & { customerName: string, transactionAmount?: number })[]> => {
-    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
+    const reports = await safeDbSelect<CreditReport>('reports', supabase.from('reports').select('*'), STORAGE_KEYS.REPORTS);
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
 
     return reports
         .filter(r => r.generatedBy === partnerId)
@@ -394,9 +454,9 @@ export const getPartnerReports = async (partnerId: string): Promise<(CreditRepor
 
 export const getAdminStats = async (): Promise<AdminStats> => {
     await delay(500);
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
-    const txns = getStorage<Transaction[]>(STORAGE_KEYS.TXNS, []);
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+    const reports = await safeDbSelect<CreditReport>('reports', supabase.from('reports').select('*'), STORAGE_KEYS.REPORTS);
+    const txns = await safeDbSelect<Transaction>('transactions', supabase.from('transactions').select('*'), STORAGE_KEYS.TXNS);
     
     // Revenue from Gateway + Adjustments (ignoring wallet usage internal)
     const revenue = txns
@@ -419,8 +479,8 @@ export const getAdminStats = async (): Promise<AdminStats> => {
 
 export const getPartnerStats = async (partnerId: string): Promise<any> => {
     await delay(500);
-    const users = getStorage<User[]>(STORAGE_KEYS.USERS, []);
-    const reports = getStorage<CreditReport[]>(STORAGE_KEYS.REPORTS, []);
+    const users = await safeDbSelect<User>('users', supabase.from('users').select('*'), STORAGE_KEYS.USERS);
+    const reports = await safeDbSelect<CreditReport>('reports', supabase.from('reports').select('*'), STORAGE_KEYS.REPORTS);
     const partner = users.find(u => u.id === partnerId);
     
     const myReports = reports.filter(r => r.generatedBy === partnerId);
@@ -437,10 +497,11 @@ export const getPricing = async (): Promise<PricingConfig> => {
         USER: { CIBIL: 99, EXPERIAN: 99, EQUIFAX: 99, CRIF: 99 },
         PARTNER: { CIBIL: 49, EXPERIAN: 49, EQUIFAX: 49, CRIF: 49 }
     };
-    return getStorage<PricingConfig>(STORAGE_KEYS.PRICING, defaults);
+    const local = localStorage.getItem(STORAGE_KEYS.PRICING);
+    return local ? JSON.parse(local) : defaults;
 };
 
 export const updatePricing = async (config: PricingConfig): Promise<void> => {
     await delay(500);
-    setStorage(STORAGE_KEYS.PRICING, config);
+    localStorage.setItem(STORAGE_KEYS.PRICING, JSON.stringify(config));
 };
